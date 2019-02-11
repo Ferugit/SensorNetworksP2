@@ -21,12 +21,12 @@
 #include "events/EventQueue.h"
 
 // Application helpers
-#include "DummySensor.h"
 #include "trace_helper.h"
 #include "lora_radio_helper.h"
 #include "mbed.h"
 
-// User definitios
+// Measurements
+#include "Si7021.h"
 #include "definitions.h"
 
 using namespace events;
@@ -37,6 +37,7 @@ using namespace events;
 // If longer messages are used, these buffers must be changed accordingly.
 uint8_t tx_buffer[30];
 uint8_t rx_buffer[30];
+
 
 /*
  * Sets up an application dependent transmission timer in ms. Used only when Duty Cycling is off for testing
@@ -55,15 +56,6 @@ uint8_t rx_buffer[30];
  */
 #define CONFIRMED_MSG_RETRY_COUNTER     3
 
-/**
- * Dummy pin for dummy sensor
- */
-#define PC_9                            0
-
-/**
- * Dummy sensor class object
- */
-DS1820  ds1820(PC_9);
 
 /**
 * This event queue is the global event queue for both the
@@ -99,13 +91,27 @@ extern Thread threadGNSS;
 extern void gnss_thread();
 
 //Values of the sensors
-extern float lon, lat, hDop, height, geoide, UTCtime;
+extern float lon, lat; 				//GNSS RX
+float temperature, humidity;	//Floats
 
-// Values obtained from the measurements
-int hour, minutes, seconds;
+//TO GET MEASUREMENTS OF SOIL MOSITURE AND LIGH SENSOR
+AnalogIn soil_moisture(PA_0);
+AnalogIn light_sensor(PA_4);
+
+// Flags
+bool flagTHSensor = false;
+bool flagGNSSReceiver = true;
 
 // Functions
-void UTC2LocalTime();
+void int2Bytes(uint8_t bytes_temp[], float float_variable, int index);
+void float2Bytes(float float_variable, int index);
+void extractElements(uint8_t subArray[], int index);
+
+//RGB Led
+BusOut RGB(PB_13, PH_1, PH_0);//Blue, Green and Red: active with low level
+
+//Objects of sensors
+Si7021 THsensor;														//Temperature and humidity sensor
 
 /**
  * Entry point for application
@@ -159,29 +165,19 @@ int main (void)
     }
 
     printf("\r\n Connection - In Progress ...\r\n");
-
-    // make your event queue dispatching events forever
-    ev_queue.dispatch_forever();
 		
 		// Start Threads
 		threadGNSS.start(gnss_thread);
-		
-		
-		while(FOREVER){
-		
-			//GNSS Receiver
-			UTC2LocalTime();
-			printf("LocalTime: %d:%d:%d, Latitude: %0.5f, Longitud: %0.5f, hdop: %0.1f, Altura: %0.3f, geoide: %0.3f\r\n",hour, minutes, seconds, lat, lon, hDop, height, geoide);
-			//If there is fix: print I am here
-			if (lat != 0){
-				printf("I am here: https://maps.google.com/?q=%.5f,%.5f\r\n\n", lat, lon);
-			}
-			else{
-				printf("NO FIX DATA\r\n\n");
-			}
-			
-			wait(WAIT_TEST_MODE);
+		 	
+		//Initialization of TH sensor
+		if(THsensor.check()){
+			flagTHSensor = true;
 		}
+		
+		RGB = ALL_OFF;
+		
+    // make your event queue dispatching events forever
+    ev_queue.dispatch_forever();
 		
     return 0;
 }
@@ -196,17 +192,48 @@ static void send_message()
     int16_t retcode;
     float sensor_value;
 
-    if (ds1820.begin()) {
-        ds1820.startConversion();
-        sensor_value = ds1820.read();
-        ds1820.startConversion();
-    } else {
-        printf("\r\n No sensor found \r\n");
-        return;
-    }
-
-    packet_len = sprintf((char*) tx_buffer, "%3.1f", sensor_value);//here generate the buffer, up to 30 bytes
-
+		float2Bytes(lat, 0);//lat
+		float2Bytes(lon, 4);//long
+	
+		float2Bytes(light_sensor*100, 8);
+		float2Bytes(soil_moisture*100, 12);
+		
+		//TEMPERATURE AND HUMIDITY SENSOR
+		if(flagTHSensor){
+			//Perform the measurement
+			if(THsensor.measure()){
+				//Get the values of the relative humidity and the temperature 
+					temperature   =    THsensor.get_temperature();
+					humidity   		=    THsensor.get_humidity();
+			}
+		}
+		
+		float2Bytes(temperature, 16);
+		float2Bytes(humidity, 20);
+		
+		//Check if the value is witted right in the buffer
+		
+		uint8_t recovered_float_lat[4];
+		uint8_t recovered_float_long[4];
+		uint8_t recovered_float_light[4];
+		uint8_t recovered_float_moisture[4];
+		uint8_t recovered_float_temp[4];
+		uint8_t recovered_float_hum[4];
+		extractElements(recovered_float_lat, 0);
+		extractElements(recovered_float_long, 4);
+		extractElements(recovered_float_light, 8);
+		extractElements(recovered_float_moisture, 12);
+		extractElements(recovered_float_temp, 16);
+		extractElements(recovered_float_hum, 20);
+		printf("\r\n Result Latitude: %.5f", *(float*)recovered_float_lat);
+		printf("\r\n Result Longitude: %.5f", *(float*)recovered_float_long);
+		printf("\r\n Result Light: %.5f", *(float*)recovered_float_light);
+		printf("\r\n Result Moisture: %.5f", *(float*)recovered_float_moisture);
+		printf("\r\n Result Temperature: %.5f", *(float*)recovered_float_temp);
+		printf("\r\n Result Humidity: %.5f", *(float*)recovered_float_hum);
+			
+    packet_len = 24;
+		
 
     retcode = lorawan.send(MBED_CONF_LORA_APP_PORT, tx_buffer, packet_len,
                            MSG_CONFIRMED_FLAG);
@@ -240,7 +267,33 @@ static void receive_message()
 
     for (uint8_t i = 0; i < retcode; i++) {
         printf("%x", rx_buffer[i]);
+				if (rx_buffer[i] == 0x52){
+				}
     }
+		
+		switch(rx_buffer[0]){
+			case 0x4F://Character O: OFF
+				RGB = ALL_OFF; 
+				break;
+			case 0x47://Character G: GREEN
+				RGB = GREEN_ON;
+				break;
+			case 0x52://Character R: RED
+				RGB = RED_ON;
+				break;
+			case 0x59://Character Y: YELLOW
+				RGB = YELLOW_ON;
+				break;
+			case 0x4D://Character M: MAGENTA
+				RGB = MAGENTA_ON;
+				break;
+			case 0x43://Character C: CYAN
+				RGB = CYAN_ON;
+				break;
+			case 0x57://Character W: WHITE
+				RGB = WHITE_ON;
+				break;
+		}
 
     printf("\r\n Data Length: %d\r\n", retcode);
 
@@ -298,15 +351,17 @@ static void lora_event_handler(lorawan_event_t event)
     }
 }
 
-
-void UTC2LocalTime(){
-	
-	hour = (int)UTCtime/10000;
-	minutes = (int)UTCtime/100 - hour*100;
-	seconds = (int)(UTCtime - hour*10000 - minutes*100);
-	hour ++;
+void float2Bytes(float float_variable, int index){ 
+  memcpy(tx_buffer+index, ( char*) (&float_variable), 4);
 }
 
+void int2Bytes(uint8_t bytes_temp[], int int_variable, int index){ 
+  memcpy(bytes_temp+index, ( char*) (&int_variable), 4);
+}
 
-
+void extractElements(uint8_t subArray[], int index)
+{
+    for (int i = 0; i < 4; i++)
+        subArray[i] = tx_buffer[index+i];
+}
 // EOF
